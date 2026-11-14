@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 
+from . import agent
 from .connector import ID, Connector
 from .store import Store
 from .wire import Peer, RpcError
@@ -70,7 +71,7 @@ class Plugin:
             config = params.get("config") or {}
             backend = self.make_backend(data_dir, config.get("region") or "feishu")
             self.connector = Connector(backend, Store(os.path.join(data_dir, "larkx.db")), Hub(self.peer),
-                                       config.get("triage_rules") or "")
+                                       config.get("triage_rules") or "", agent.Settings(config))
             self.connector.start()
         return {"protocol": PROTOCOL, "id": self.manifest["id"], "version": self.manifest["version"], "contributes": self.manifest["contributes"]}
 

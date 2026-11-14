@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "larkx",
   "name": "飞书（LarkAgentX）",
-  "version": "0.2.1",
-  "description": "用 LarkAgentX 以你本人的身份接飞书：扫码登录，全部消息进收件箱和知识库，经手机确认后以你的身份发送；在任意会话里发 /agent 交给助手。走逆向的网页版协议，不是官方接口。",
+  "version": "0.3.0",
+  "description": "用 LarkAgentX 以你本人的身份接飞书：扫码登录，全部消息进收件箱和知识库，经手机确认后以你的身份发送；在任意会话里发 /agent（前缀可以改）或 @自己 交给助手。走逆向的网页版协议，不是官方接口。",
   "publisher": "nwverse",
   "homepage": "https://github.com/cv-cat/LarkAgentX",
   "icon": "assets/icon.png",
@@ -64,7 +64,7 @@
         "name": "飞书 /agent",
         "kind": "im",
         "connector": "larkx",
-        "description": "在任意飞书会话里发「/agent 要做的事」，交给助手；助手以你的身份回复在那条消息下面，末尾标明 AI 代答。",
+        "description": "在任意飞书会话里发「/agent 要做的事」（前缀在扩展设置里改），或在自己的消息里 @自己，交给助手；助手以你的身份回复在那条消息下面，末尾标明 AI 代答。",
         "capabilities": {
           "format": "plain",
           "max_text": 4000,
@@ -98,6 +98,94 @@
         "description": "用你自己的话写飞书消息怎么分拣，比如「直属领导的私聊都要处理」「某某群只看 @ 我的」。留空用 hub 的全局规则。",
         "maxLength": 4000,
         "default": ""
+      },
+      "agent_trigger_prefix": {
+        "type": "boolean",
+        "title": "/agent：用前缀叫助手",
+        "description": "消息以下面的前缀开头就交给助手（不分大小写，后面跟空格、换行、冒号或什么都不跟；开头的 @ 不算）。关掉后只能用 @自己 叫。",
+        "default": true
+      },
+      "agent_prefix": {
+        "type": "string",
+        "title": "/agent：前缀",
+        "description": "默认 /agent。改了以后旧前缀就不再算；前缀后面直接连着字的不算，比如 /agents。",
+        "default": "/agent",
+        "pattern": "^[^\\s:：]{1,32}$",
+        "minLength": 1,
+        "maxLength": 32
+      },
+      "agent_trigger_self_mention": {
+        "type": "boolean",
+        "title": "/agent：@自己也算",
+        "description": "你在自己的消息里 @ 自己也交给助手。按账号的 user_id 认，不认显示名；和前缀同时出现只算一次。",
+        "default": true
+      },
+      "agent_owner_only": {
+        "type": "boolean",
+        "title": "/agent：只认我",
+        "description": "开着：只有你和白名单里的人能叫；关掉：除黑名单里的人以外谁都能叫。你自己永远能叫；群里别人要 @ 你才算，你自己不用。别人的请求现在还不会交给助手：hub 的渠道只收你本人的消息，开不了只带回复工具的访客对话。",
+        "default": true
+      },
+      "agent_allow": {
+        "type": "array",
+        "title": "/agent：白名单",
+        "description": "「只认我」开着时，这些人也能叫。一行一个人：名字加飞书 user_id，比如「张三 7000000000000000001」。只认 user_id，名字是给你看的；可以让助手用 larkx_search 查到 id 再填进来。",
+        "items": {
+          "type": "string",
+          "pattern": "[0-9]{6,}",
+          "maxLength": 200
+        },
+        "maxItems": 200,
+        "uniqueItems": true,
+        "default": []
+      },
+      "agent_deny": {
+        "type": "array",
+        "title": "/agent：黑名单",
+        "description": "这些人不能叫，「只认我」关掉时也不能；同时在白名单里也不能。格式和白名单一样。",
+        "items": {
+          "type": "string",
+          "pattern": "[0-9]{6,}",
+          "maxLength": 200
+        },
+        "maxItems": 200,
+        "uniqueItems": true,
+        "default": []
+      },
+      "agent_deny_reply": {
+        "type": "string",
+        "title": "/agent：没权限时回复",
+        "description": "不能叫的人发了前缀（群里还 @ 了你）时，以你的名义回这句话，同一个人在同一个会话里 10 分钟内只回一次。默认留空，什么都不回：以你的名义回同事「没有权限」很怪。",
+        "maxLength": 500,
+        "default": ""
+      },
+      "agent_follow": {
+        "type": "string",
+        "title": "/agent：话题里接着聊",
+        "description": "在一个话题里叫过助手以后，你在这个话题里接着发的消息不带前缀也交给助手；发 /stop（或 /停止、/停）或一段时间没动静就不再接。群的话题默认不接：不然你在群里跟同事说的每句话都会被接走。",
+        "default": "dm",
+        "oneOf": [
+          {
+            "const": "dm",
+            "title": "只在私聊的话题里"
+          },
+          {
+            "const": "all",
+            "title": "私聊和群的话题里都接"
+          },
+          {
+            "const": "off",
+            "title": "不接，每次都要前缀"
+          }
+        ]
+      },
+      "agent_follow_minutes": {
+        "type": "integer",
+        "title": "/agent：话题多久没动静就不再接（分钟）",
+        "description": "从最后一次请求或回答算起。",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 1440
       }
     }
   },

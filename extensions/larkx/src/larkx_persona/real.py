@@ -25,11 +25,47 @@ STEADY_SECONDS = 60
 BACKOFF_MOST = 60
 
 
+# A rich text element that is an @-mention; its property is an AtProperty (the user's id and the "@name" shown).
+AT_TAG = 5
+
+
 class Expired(Exception):
     """The session is over: the user has to scan again. Not being able to reach Feishu is any other exception."""
 
 
-def normalize(msg, extract_key):
+def mentions(data, at_property):
+    """Whom a message's rich text @-mentions, in order: [{"id": user id, "text": "@name" as the text shows it}].
+    at_property is LarkAgentX's AtProperty message class. Pure, for the tests."""
+    rich = data.get("richText") if isinstance(data, dict) else None
+    try:
+        elements = rich["elements"]["dictionary"]
+    except (TypeError, KeyError):
+        return []
+    if not isinstance(elements, dict):
+        return []
+    # In the order LarkAgentX writes the text in (decoders.extract_rich_text).
+    order = [k for k in rich.get("elementIds") or [] if k in elements]
+    if order:
+        order += [k for k in elements if k not in set(order)]
+    else:
+        order = sorted(elements, key=lambda k: int(k) if str(k).isdigit() else 0)
+    out = []
+    for k in order:
+        element = elements.get(k) or {}
+        prop = element.get("property")
+        if element.get("tag") != AT_TAG or not isinstance(prop, (bytes, bytearray)):
+            continue
+        at = at_property()
+        try:
+            at.ParseFromString(bytes(prop))
+        except Exception:
+            continue
+        if at.userId:
+            out.append({"id": str(at.userId), "text": at.content or ""})
+    return out
+
+
+def normalize(msg, extract_key, read_mentions=None):
     """A message of LarkAgentX's, live or from history, as the connector keeps it. Pure, for the tests."""
     msg_type = msg.get("msg_type") or 0
     name = msg.get("msg_type_name") or "UNKNOWN"
@@ -54,7 +90,19 @@ def normalize(msg, extract_key):
         "position": int(msg.get("position") or 0), "sender": str(msg.get("from_id") or ""), "type": name,
         "text": msg.get("content") or "", "at": at or time.time(), "root": "" if root == "0" else root,
         "parent": msg.get("parent_id") or "", "at_me": bool(msg.get("at_me")), "media": media,
+        "mentions": read_mentions(data) if read_mentions and isinstance(data, dict) else [],
     }
+
+
+def raw_message(v, chat, decoders):
+    """One entities.Message of a gateway response, as a dict like LarkAgentX's pull_history makes."""
+    msg_type = decoders.enum_to_int(v.get("type", 0))
+    summary, data = decoders.decode_message_content(msg_type, v.get("content", b""))
+    return {"msg_id": v.get("id"), "msg_type": msg_type, "msg_type_name": decoders.MSG_TYPE_NAMES.get(msg_type, str(msg_type)),
+            "from_id": v.get("fromId"), "chat_id": v.get("chatId") or v.get("channelId") or str(chat),
+            "chat_type": decoders.enum_to_int(v.get("chatType", 0)), "at_me": False, "root_id": v.get("rootId") or "",
+            "parent_id": v.get("parentId") or "", "position": v.get("position") or 0, "create_time": v.get("createTime"),
+            "content": summary, "content_data": data}
 
 
 def fetch_upstream(lock, data_dir, urlopen=urllib.request.urlopen):
@@ -120,6 +168,8 @@ class RealBackend:
         self._qr = None
         self._save = None
         self._extract_key = None
+        self._read_mentions = None
+        self._decoders = None
         self._lark = None
 
     def prepare(self):
@@ -139,8 +189,11 @@ class RealBackend:
         logger.add(sys.stderr, level="ERROR", format="larkx: {level} {name}:{function}:{line}")
         import larkx
         from larkx import media
+        from larkx.proto import decoders, proto_pb2
         self._lark = larkx
         self._extract_key = media.extract_resource_key
+        self._read_mentions = lambda data: mentions(data, proto_pb2.AtProperty)
+        self._decoders = decoders
 
     def _deps(self):
         requirements = os.path.join(self._root, "requirements.txt")
@@ -257,7 +310,7 @@ class RealBackend:
         wait = 1
 
         async def received(msg):
-            await asyncio.to_thread(on_message, normalize(msg, self._extract_key))
+            await asyncio.to_thread(on_message, normalize(msg, self._extract_key, self._read_mentions))
 
         while not stop.is_set():
             client, began = self._client, time.time()
@@ -303,7 +356,21 @@ class RealBackend:
         return self._client.search(query)
 
     def history(self, chat, positions):
-        return [normalize(m, self._extract_key) for m in self._client.pull_history(chat, positions)]
+        return [normalize(m, self._extract_key, self._read_mentions) for m in self._client.pull_history(chat, positions)]
+
+    def thread(self, chat, root, most):
+        """The topic rooted at message root: the root and its last replies (at most most), as history gives them.
+        Feishu's topic id is its root message's id. Empty when Feishu knows no such topic."""
+        found = self._client.api("thread.PullThreadsByIDsRequest", {"threadIds": [str(root)]}) or {}
+        out = list((found.get("rootMessages") or {}).values())
+        topic = (found.get("threads") or {}).get(str(root)) or {}
+        last = int(topic.get("lastMessagePosition") or 0)
+        if last > 0:
+            positions = list(range(max(0, last - most + 1), last + 1))
+            replies = self._client.api("thread.PullThreadMessagesByPositionsRequest", {"threadId": str(root), "positions": positions}) or {}
+            ordered = sorted((replies.get("messages") or {}).items(), key=lambda kv: int(kv[0]))
+            out += [v for _, v in ordered]
+        return [normalize(raw_message(v, chat, self._decoders), self._extract_key, self._read_mentions) for v in out]
 
     def chat_info(self, chat):
         info = self._client.get_chat_info(chat) or {}

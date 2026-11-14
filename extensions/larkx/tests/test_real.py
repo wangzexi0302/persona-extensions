@@ -63,8 +63,58 @@ class RealTest(unittest.TestCase):
         return tc.SerializeToString()
 
     def normalized(self, raw):
-        from larkx_persona.real import normalize
-        return [normalize(m, self.media.extract_resource_key) for m in self.decoders.decode_push_messages(raw)]
+        from larkx_persona.real import mentions, normalize
+        read = lambda data: mentions(data, self.P.AtProperty)  # noqa: E731
+        return [normalize(m, self.media.extract_resource_key, read) for m in self.decoders.decode_push_messages(raw)]
+
+    def rich_text(self, parts):
+        """A text message's content from ("text", words) and ("at", user id, "@name") parts, in order."""
+        tc = self.P.TextContent()
+        for i, part in enumerate(parts):
+            key = str(i + 1)
+            element = tc.richText.elements.dictionary[key]
+            if part[0] == "at":
+                prop = self.P.AtProperty()
+                prop.userId, prop.content = part[1], part[2]
+                element.tag = 5
+            else:
+                prop = self.P.TextProperty()
+                prop.content = part[1]
+                element.tag = 1
+            element.property = prop.SerializeToString()
+            tc.richText.elementIds.append(key)
+        return tc.SerializeToString()
+
+    def test_mentions_are_read_by_user_id(self):
+        content = self.rich_text([("at", "7002", "@我"), ("text", " /agent 帮我看下 "), ("at", "7003", "@小李")])
+        m = self.normalized(self.frame([self.message("9005", 4, content)]))[0]
+        self.assertEqual(m["text"], "@我 /agent 帮我看下 @小李")
+        self.assertEqual(m["mentions"], [{"id": "7002", "text": "@我"}, {"id": "7003", "text": "@小李"}])
+        plain = self.normalized(self.frame([self.message("9006", 4, self.text("没有 @ 谁"))]))[0]
+        self.assertEqual(plain["mentions"], [])
+
+    def test_a_topic_is_read_from_the_gateway(self):
+        from protobuf_to_dict import protobuf_to_dict
+        from larkx_persona.real import RealBackend
+        root = protobuf_to_dict(self.message("9100", 4, self.text("话题开头"), chat_type=1))
+        reply = protobuf_to_dict(self.message("9101", 4, self.text("回复"), chat_type=1, root="9100"))
+        asked = []
+
+        class Client:
+            def api(self, name, data):
+                asked.append((name, data))
+                if name == "thread.PullThreadsByIDsRequest":
+                    return {"threads": {"9100": {"id": "9100", "lastMessagePosition": 3}}, "rootMessages": {"9100": root}}
+                return {"messages": {"3": reply}}
+
+        backend = RealBackend(ROOT, self.home.name, "feishu")
+        backend._client, backend._decoders = Client(), self.decoders
+        backend._extract_key = self.media.extract_resource_key
+        backend._read_mentions = lambda data: []
+        got = backend.thread("6001", "9100", 2)
+        self.assertEqual([(m["id"], m["text"], m["root"], m["chat_kind"]) for m in got],
+                         [("9100", "话题开头", "", "dm"), ("9101", "回复", "9100", "dm")])
+        self.assertEqual(asked[1], ("thread.PullThreadMessagesByPositionsRequest", {"threadId": "9100", "positions": [2, 3]}))
 
     def test_a_text_in_a_group_that_mentions_the_user(self):
         m = self.normalized(self.frame([self.message("9001", 4, self.text("周五开会"))], at_me=["9001"]))[0]

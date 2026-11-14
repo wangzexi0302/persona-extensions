@@ -77,6 +77,9 @@ class FixtureBackend:
     def history(self, chat, positions):
         return []
 
+    def thread(self, chat, root, most):
+        return []
+
     def chat_info(self, chat):
         return {"name": {"c_group": "示例群", "c_noisy": "示例大群"}.get(chat, "示例联系人"), "last_position": 0}
 

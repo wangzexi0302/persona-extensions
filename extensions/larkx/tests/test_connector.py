@@ -34,6 +34,8 @@ class Backend:
         self.send_error = None
         self.chats = {}
         self.older = {}
+        self.topics = {}
+        self.topic_calls = []
         self.restored = []
         self.restore_error = None
         self.poll = "waiting"
@@ -89,6 +91,10 @@ class Backend:
     def history(self, chat, positions):
         return [self.older[p] for p in positions if p in self.older]
 
+    def thread(self, chat, root, most):
+        self.topic_calls.append((chat, root))
+        return self.topics.get(root, [])[-most - 1:]
+
     def chat_info(self, chat):
         return self.chats.get(chat, {"name": "", "last_position": 0})
 
@@ -122,9 +128,11 @@ class Hub:
         pass
 
 
-def message(msg_id, chat, position, sender="u_a", text="你好", kind="dm", at_me=False, msg_type="TEXT", at=None, root="", media=None):
+def message(msg_id, chat, position, sender="u_a", text="你好", kind="dm", at_me=False, msg_type="TEXT", at=None, root="", media=None,
+            mentions=None):
     return {"id": msg_id, "chat": chat, "chat_kind": kind, "position": position, "sender": sender, "type": msg_type, "text": text,
-            "at": at or time.time() - 60 + position, "root": root, "parent": "", "at_me": at_me, "media": media or []}
+            "at": at or time.time() - 60 + position, "root": root, "parent": "", "at_me": at_me, "media": media or [],
+            "mentions": mentions or []}
 
 
 class ConnectorTest(unittest.TestCase):

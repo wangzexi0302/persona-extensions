@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_chat ON messages (chat, position);
 CREATE TABLE IF NOT EXISTS names (id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sends (key TEXT PRIMARY KEY, result TEXT);
+CREATE TABLE IF NOT EXISTS agent_asks (
+  id TEXT PRIMARY KEY, chat TEXT NOT NULL, topic TEXT NOT NULL, sender TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_topics (topic TEXT PRIMARY KEY, chat TEXT NOT NULL, last_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS own_sends (id TEXT PRIMARY KEY, at REAL NOT NULL);
 """
 
 
@@ -83,6 +87,22 @@ class Store:
         rows = self._all("SELECT * FROM messages WHERE %s ORDER BY position DESC, at DESC, seq DESC LIMIT ?" % where, *args, limit)
         return [_message(r) for r in reversed(rows)]
 
+    def messages_before(self, chat, position, at, limit):
+        """Up to limit messages of chat's own flow (not its topics' replies, whose positions are below 1) before the one
+        at position, or before at when that has no position; oldest first."""
+        if position > 0:
+            where, args = "chat = ? AND position > 0 AND position < ?", [chat, position]
+        else:
+            where, args = "chat = ? AND position > 0 AND at <= ?", [chat, at]
+        rows = self._all("SELECT * FROM messages WHERE %s ORDER BY position DESC, at DESC, seq DESC LIMIT ?" % where, *args, limit)
+        return [_message(r) for r in reversed(rows)]
+
+    def topic_messages(self, chat, root, at, limit):
+        """Up to limit messages of the topic rooted at root, the root among them, up to at; oldest first."""
+        rows = self._all("SELECT * FROM messages WHERE chat = ? AND (id = ? OR root = ?) AND at <= ?"
+                         " ORDER BY at DESC, seq DESC LIMIT ?", chat, root, root, at, limit)
+        return [_message(r) for r in reversed(rows)]
+
     def oldest_position(self, chat):
         row = self._one("SELECT MIN(position) AS p FROM messages WHERE chat = ? AND position > 0", chat)
         return (row or {}).get("p") or 0
@@ -119,6 +139,39 @@ class Store:
 
     def finish_send(self, key, result):
         self._do("UPDATE sends SET result = ? WHERE key = ?", result, key)
+
+    # /agent: the requests handed to the hub, the topics followed, and what this program sent
+
+    def add_ask(self, msg_id, chat, topic, sender, at):
+        self._do("INSERT OR IGNORE INTO agent_asks (id, chat, topic, sender, at) VALUES (?, ?, ?, ?, ?)", msg_id, chat, topic, sender, at)
+
+    def ask(self, msg_id):
+        return self._one("SELECT * FROM agent_asks WHERE id = ?", msg_id)
+
+    def follow_topic(self, topic, chat, at):
+        self._do("INSERT INTO agent_topics (topic, chat, last_at) VALUES (?, ?, ?)"
+                 " ON CONFLICT (topic) DO UPDATE SET last_at = MAX(last_at, excluded.last_at)", topic, chat, at)
+
+    def touch_topic(self, topic, at):
+        """Something happened in a followed topic: it is followed from at on. Nothing for a topic not followed."""
+        self._do("UPDATE agent_topics SET last_at = MAX(last_at, ?) WHERE topic = ?", at, topic)
+
+    def topic(self, topic):
+        return self._one("SELECT * FROM agent_topics WHERE topic = ?", topic)
+
+    def end_topic(self, topic):
+        self._do("DELETE FROM agent_topics WHERE topic = ?", topic)
+
+    def add_own(self, msg_id, at):
+        self._do("INSERT OR IGNORE INTO own_sends (id, at) VALUES (?, ?)", msg_id, at)
+
+    def is_own(self, msg_id):
+        return self._one("SELECT id FROM own_sends WHERE id = ?", msg_id) is not None
+
+    def prune_agent(self, before_at):
+        """Forgets requests, followed topics and sent ids from before before_at; how many rows went."""
+        return sum(self._do("DELETE FROM %s WHERE %s < ?" % (table, column), before_at)
+                   for table, column in (("agent_asks", "at"), ("agent_topics", "last_at"), ("own_sends", "at")))
 
 
 def _message(row):

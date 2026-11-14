@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from . import agent
 from .wire import RpcError
 
 ID = "larkx"
@@ -35,14 +36,17 @@ RESTORE_RETRY_SECONDS = 30
 LINK_WAIT_SECONDS = 5
 CHANNEL = "channel."
 CANNOT_SEND = "cannot_send"
-# /agent: the user's own message starting with it goes to the assistant; the answer comes back in that chat.
-AGENT_PREFIX = "/agent"
-AGENT_SUFFIX = "🤖 AI 代答，仅供参考"
-AGENT_EMPTY = "（只发了 /agent：看上面的上下文和引用的消息，判断要做什么。）"
-AGENT_TYPES = ("TEXT", "POST")
+# /agent: a request (agent.py says which messages are) goes to the assistant; the answer comes back in that chat.
+AGENT_SUFFIX = agent.SUFFIX
 AGENT_FRESH_SECONDS = 600
 AGENT_CONTEXT_MESSAGES = 20
 AGENT_RETRY_SECONDS = [2, 5, 15]
+# Handed-over requests, followed topics and the ids of what this program sent are kept this long.
+AGENT_KEEP_SECONDS = 3 * 86400
+# Someone not allowed to ask gets the deny reply (when there is one) at most this often in one chat.
+AGENT_DENY_SECONDS = 600
+# A message of this program's own can come back on the long connection before its send has returned the id.
+AGENT_SENDING_SECONDS = 120
 SIGNED_OUT_ERROR = "还没登录飞书"
 SIGN_IN_GUIDE = ["在连接器设置里打开「飞书（LarkAgentX）」，用飞书 App 扫码登录。"]
 SEND_SCHEMA = {
@@ -97,11 +101,16 @@ def media_ref(msg_id, key):
 
 
 class Connector:
-    def __init__(self, backend, store, hub, rules=""):
+    def __init__(self, backend, store, hub, rules="", agent_settings=None):
         self.backend = backend
         # The user's own triage rules (setting triage_rules): handed over with every inbox item, the hub uses them
         # instead of its global ones. The hub reads at most 4000 characters.
         self.rules = (rules or "").strip()[:4000]
+        # The agent_* settings: what counts as an /agent request, and who may ask.
+        self.agent = agent_settings or agent.Settings()
+        self._denied = {}
+        self._sending = {}
+        self._last_agent_prune = 0.0
         self.store = store
         self.hub = hub
         self._ready = threading.Event()
@@ -134,6 +143,7 @@ class Connector:
 
     def start(self):
         """Gets the program going behind the handshake: the hub does not wait for the dependencies or the sign-in."""
+        self._log(self.agent.summary())
         threading.Thread(target=self._boot, daemon=True).start()
         threading.Thread(target=self._announce, daemon=True).start()
 
@@ -252,30 +262,124 @@ class Connector:
     # /agent: the channel (docs/extensions/channels.md "Contributing a channel" in Persona)
 
     def _maybe_agent(self, m):
-        """Hands the user's own fresh "/agent …" to the hub, which puts it in the assistant's chat and answers through
-        channel.send. Someone else's /agent, an old one, and our own answers never count."""
+        """Hands a fresh request of the user's own to the hub, which puts it in the assistant's chat and answers
+        through channel.send: a message with the prefix or a self-mention (agent.read), /stop, or, in a topic the
+        assistant follows, any message. Someone else's request is weighed against the settings but never handed
+        over: the hub's channel takes the owner's messages only. Old messages and our own sends never count."""
         with self._lock:
             me = self._account_id
-        if not me or m.get("sender") != me or m.get("type") not in AGENT_TYPES:
+        if not me or m.get("type") not in agent.TYPES:
             return
         if time.time() - (m.get("at") or 0) > AGENT_FRESH_SECONDS:
             return
-        text = m.get("text") or ""
-        if text.rstrip().endswith(AGENT_SUFFIX):
+        if agent.is_answer(agent.body(m)) or self._sent_here(m):
             return
-        request = agent_request(text)
-        if request is None:
+        if m.get("sender") != me:
+            self._others_request(m, me)
             return
-        threading.Thread(target=self._hand_over, args=(m, request), daemon=True).start()
+        asked = agent.read(m, me, self.agent)
+        if asked is not None:
+            text, how = asked
+            topic = m.get("root") or m["id"]
+            if agent.is_stop(text):
+                self.store.end_topic(topic)
+                text = "/stop"
+            else:
+                self.store.follow_topic(topic, m["chat"], time.time())
+            self._spawn_hand_over(m, text, how)
+            return
+        self._follow_up(m)
 
-    def _hand_over(self, m, request):
-        message = {"id": m["id"], "text": request or AGENT_EMPTY}
-        context = self._agent_context(m)
-        if context:
-            message["forward"] = context
-        parent = self.store.message(m.get("parent") or "") if m.get("parent") else None
-        if parent:
-            message["quote"] = _line(parent)
+    def _follow_up(self, m):
+        """The user's message without a trigger, in a topic where they asked lately: /stop ends it, and anything else
+        goes on to the assistant while the settings follow topics of that kind of chat."""
+        topic = self.store.topic(m.get("root") or "") if m.get("root") else None
+        if topic is None or topic["chat"] != m["chat"]:
+            return
+        if time.time() - topic["last_at"] > self.agent.follow_seconds:
+            self.store.end_topic(topic["topic"])
+            return
+        if agent.is_stop(agent.body(m), m.get("mentions")):
+            self.store.end_topic(topic["topic"])
+            self._spawn_hand_over(m, "/stop", "stop")
+            return
+        kind = m.get("chat_kind") or (self.store.chat(m["chat"]) or {}).get("kind") or "group"
+        if not self.agent.follows(kind):
+            return
+        self.store.touch_topic(topic["topic"], time.time())
+        self._spawn_hand_over(m, agent.body(m).strip(), "follow")
+
+    def _others_request(self, m, me):
+        """Someone else's prefix (in a group only with an @-mention of the user). Not handed over either way: the
+        hub's channel would put it in the user's own assistant, with all of the user's tools."""
+        s = self.agent
+        if not s.trigger_prefix:
+            return
+        if agent.after_prefix(agent.strip_leading_mentions(agent.body(m), m.get("mentions")), s.prefix) is None:
+            return
+        if (m.get("chat_kind") or "group") != "dm" and not agent.mentions_me(m, me):
+            return
+        if not s.may_ask(m.get("sender"), me):
+            self._log("agent: a request from someone who may not ask was ignored")
+            self._deny(m)
+            return
+        self._log("agent: a request from someone allowed to ask was not handed over: the hub's channel takes the owner's"
+                  " messages only and cannot open a guest conversation")
+
+    def _deny(self, m):
+        """The deny reply, when the settings have one: under the request, at most every AGENT_DENY_SECONDS per person
+        and chat."""
+        text = self.agent.deny_reply
+        if not text:
+            return
+        key = (m["chat"], m.get("sender") or "")
+        now = time.time()
+        with self._lock:
+            if now - self._denied.get(key, 0) < AGENT_DENY_SECONDS:
+                return
+            self._denied[key] = now
+
+        def send():
+            try:
+                self._post(m["chat"], text, m.get("root") or m["id"])
+            except Exception as e:
+                self._log("agent: the deny reply failed: %s" % type(e).__name__)
+
+        threading.Thread(target=send, daemon=True).start()
+
+    def _post(self, chat, text, root):
+        """Sends as the user, remembering it was this program: its echo on the long connection is no request."""
+        with self._lock:
+            self._sending[(chat, text.strip())] = time.time()
+        msg_id = self.backend.send(chat, text, root)
+        if msg_id:
+            self.store.add_own(str(msg_id), time.time())
+        return msg_id
+
+    def _sent_here(self, m):
+        if self.store.is_own(m["id"]):
+            return True
+        now = time.time()
+        with self._lock:
+            for key, at in list(self._sending.items()):
+                if now - at > AGENT_SENDING_SECONDS:
+                    del self._sending[key]
+            return (m["chat"], (m.get("text") or "").strip()) in self._sending
+
+    def _spawn_hand_over(self, m, text, how):
+        threading.Thread(target=self._hand_over, args=(m, text, how), daemon=True).start()
+
+    def _hand_over(self, m, text, how):
+        message = {"id": m["id"], "text": text or self._empty_request(how)}
+        if how != "stop":
+            context = self._agent_context(m, how)
+            if context:
+                message["forward"] = context
+            parent = self.store.message(m.get("parent") or "") if m.get("parent") else None
+            if parent:
+                message["quote"] = _line(parent)
+        # Kept before the hub has it: channel.send answers only a request handed over.
+        self.store.add_ask(m["id"], m["chat"], m.get("root") or m["id"], m.get("sender") or "", time.time())
         for wait in AGENT_RETRY_SECONDS + [None]:
             try:
                 # The hub keeps each message id once: handing it over again after a cut-off call answers it once.
@@ -287,26 +391,55 @@ class Connector:
                     return
                 time.sleep(wait)
 
-    def _agent_context(self, m):
-        """Where the request was written and what was said there just before it, for the assistant."""
+    def _empty_request(self, how):
+        if how == "mention":
+            return "（只 @ 了自己：看上面的上下文和引用的消息，判断要做什么。）"
+        return "（只发了 %s：看上面的上下文和引用的消息，判断要做什么。）" % self.agent.prefix
+
+    def _agent_context(self, m, how="prefix"):
+        """Where the request was written and what was said there before it, for the assistant: the topic's messages
+        when it is in a topic, else the chat's own messages just before it."""
         chat = self.store.chat(m["chat"]) or {}
-        before = [x for x in self.store.messages(m["chat"], m.get("position") or 0, AGENT_CONTEXT_MESSAGES) if x["id"] != m["id"]]
-        where = "飞书%s「%s」" % (_kind_label(chat.get("kind") or "group"), chat.get("name") or "未命名")
+        where = "飞书%s「%s」" % (_kind_label(chat.get("kind") or m.get("chat_kind") or "group"), _title(chat))
+        lead = "这条消息是在话题里接着说的，没带前缀，" if how == "follow" else "这条请求"
+        if m.get("root"):
+            before = [x for x in self._topic(m) if x["id"] != m["id"]]
+            where += "的一个话题"
+            what = "话题里之前的"
+        else:
+            before = [x for x in self.store.messages_before(m["chat"], m.get("position") or 0, m.get("at") or time.time(), AGENT_CONTEXT_MESSAGES)
+                      if x["id"] != m["id"]]
+            what = "之前的"
         if not before:
-            return "这条 /agent 写在%s里。" % where
-        return "这条 /agent 写在%s里，之前的 %d 条消息：\n%s" % (where, len(before), "\n".join(_line(x) for x in before))
+            return "%s写在%s里。" % (lead, where)
+        return "%s写在%s里，%s %d 条消息：\n%s" % (lead, where, what, len(before), "\n".join(_line(x) for x in before))
+
+    def _topic(self, m):
+        """The messages of m's topic up to m, read from the server first when its root is not kept here (the topic began
+        before this program saw the chat, or its messages were pruned)."""
+        root, at = m["root"], m.get("at") or time.time()
+        if self.store.message(root) is None:
+            try:
+                for x in self.backend.thread(m["chat"], root, AGENT_CONTEXT_MESSAGES):
+                    self.on_message(x)
+            except Exception as e:
+                self._log("agent: reading the topic failed: %s" % type(e).__name__)
+        return self.store.topic_messages(m["chat"], root, at, AGENT_CONTEXT_MESSAGES + 1)
 
     def channel_send(self, p):
-        """An answer for one /agent: in the chat it was written in, under it, as the user, marked as written by AI.
-        A ref is sent once; a send whose result is unknown is never tried again."""
+        """An answer for one request: in the chat it was written in, under it, as the user, marked as written by AI.
+        Only a request handed over to the hub, from someone who may still ask, is answered (one of the user's own
+        "/agent" from before 0.3, which kept no record, too). A ref is sent once; a send whose result is unknown is
+        never tried again."""
         ref = p.get("ref") or ""
         if not ref:
             raise RpcError("channel.send without a ref", "invalid_params")
         with self._lock:
             signed_in, me = self._signed_in, self._account_id
-        request = self.store.message(p.get("reply_to") or "") if p.get("reply_to") else None
-        if not signed_in or request is None or request["sender"] != me or agent_request(request["text"]) is None or request["text"].rstrip().endswith(AGENT_SUFFIX):
-            # Only an answer to one of the user's own /agent goes out: nothing in a chat they did not ask in.
+        reply_to = p.get("reply_to") or ""
+        request = self.store.message(reply_to) if reply_to else None
+        if not signed_in or request is None or agent.is_answer(request["text"]) or not self._answerable(request, me):
+            # Nothing in a chat nobody asked in.
             raise RpcError("没有可以回复的 /agent 消息", CANNOT_SEND)
         key = "channel:" + ref
         claimed, result = self.store.claim_send(key)
@@ -316,13 +449,20 @@ class Connector:
             raise RpcError(_UNKNOWN_SEND)
         text = (p.get("text") or "").rstrip() + "\n\n" + AGENT_SUFFIX
         try:
-            msg_id = self.backend.send(request["chat"], text, request.get("root") or request["id"])
+            msg_id = self._post(request["chat"], text, request.get("root") or request["id"])
         except Exception:
             msg_id = None
         if not msg_id:
             raise RpcError(_UNKNOWN_SEND)
         self.store.finish_send(key, str(msg_id))
+        self.store.touch_topic(request.get("root") or request["id"], time.time())
         return {"message_id": str(msg_id)}
+
+    def _answerable(self, request, me):
+        asked = self.store.ask(request["id"])
+        if asked is not None:
+            return self.agent.may_ask(asked["sender"], me)
+        return request["sender"] == me and agent_request(agent.body(request), self.agent.prefix) is not None
 
     def channel_typing(self, _):
         return {}
@@ -407,7 +547,8 @@ class Connector:
         name, args = p.get("name"), p.get("args") or {}
         if name == "larkx_status":
             s = self.status({})
-            return {"text": "%s: %s" % (s.get("account") or "飞书", "在收消息" if s["state"] == "ok" else s.get("error", s["state"]))}
+            line = "%s: %s" % (s.get("account") or "飞书", "在收消息" if s["state"] == "ok" else s.get("error", s["state"]))
+            return {"text": line + "\n" + self._agent_rules()}
         if name == "larkx_chats":
             rows = self.store.chats(_limit(args, 20), args.get("query") or "")
             lines = ["%s  %s〔%s〕 %s" % (r["id"], _title(r), _kind_label(r["kind"]), local_time(r["last_at"])) for r in rows]
@@ -421,6 +562,27 @@ class Connector:
             found = self.backend.search(_required(args, "query"))
             return {"text": "\n".join("%s  %s〔%s〕" % (r["id"], r["title"], r["type"]) for r in found) or "没有找到。"}
         raise RpcError("没有这个工具：%s" % name)
+
+    def _agent_rules(self):
+        """The agent_* settings in force, in a sentence for the user, with the names of the people on the lists."""
+        s = self.agent
+        triggers = (["前缀「%s」" % s.prefix] if s.trigger_prefix else []) + (["@自己"] if s.self_mention else [])
+        out = "/agent：" + ("用" + "或".join(triggers) + "叫助手" if triggers else "前缀和 @自己都关了，叫不了助手")
+        if s.owner_only:
+            out += "；只认你" + ("和白名单里的 %s" % self._names(s.allow) if s.allow else "")
+            if s.deny:
+                out += "（黑名单里的 %s 不算）" % self._names(s.deny)
+        else:
+            out += "；除了黑名单里的 %s，谁都能叫" % self._names(s.deny) if s.deny else "；谁都能叫"
+        if s.allow or not s.owner_only:
+            out += "；别人的请求现在还不会交给助手：hub 的渠道只收你本人的消息，开不了访客对话"
+        follow = {agent.FOLLOW_DM: "私聊的话题里", agent.FOLLOW_ALL: "私聊和群的话题里"}.get(s.follow)
+        if follow:
+            out += "；%s叫过以后，不带前缀也接着聊，%d 分钟没动静或发 /stop 就停" % (follow, s.follow_seconds // 60)
+        return out + "。"
+
+    def _names(self, people):
+        return "、".join(name or self.store.name(uid) or "user_id …" + uid[-4:] for uid, name in people.items())
 
     def _need_signed_in(self):
         if not self._signed_in:
@@ -501,7 +663,7 @@ class Connector:
             quoted = self.store.message(reply_to) or {}
             root = quoted.get("root") or reply_to
         try:
-            msg_id = self.backend.send(chat, text, root)
+            msg_id = self._post(chat, text, root)
         except Exception:
             msg_id = None
         if not msg_id:
@@ -670,8 +832,14 @@ class Connector:
 
     def _prune(self, archived):
         """Deletes messages older than KEEP_DAYS that the archive has passed (row archived and before): a cursor the
-        hub hands back is one whose rows it has kept."""
+        hub hands back is one whose rows it has kept. What /agent keeps goes after AGENT_KEEP_SECONDS, archived or not."""
         now = time.time()
+        if now - self._last_agent_prune >= PRUNE_SECONDS:
+            self._last_agent_prune = now
+            try:
+                self.store.prune_agent(now - AGENT_KEEP_SECONDS)
+            except Exception as e:
+                self._log("pruning /agent records failed: %s" % type(e).__name__)
         if not archived or now - self._last_prune < PRUNE_SECONDS:
             return
         self._last_prune = now
@@ -780,16 +948,10 @@ def _limit(args, default):
         return default
 
 
-def agent_request(text):
-    """What the user asks with "/agent …" (case aside, then a space, a colon, a line or nothing), or None when the text
-    is not one: "/agents" is not."""
-    s = (text or "").lstrip()
-    if s[:len(AGENT_PREFIX)].lower() != AGENT_PREFIX:
-        return None
-    rest = s[len(AGENT_PREFIX):]
-    if rest and not (rest[0].isspace() or rest[0] in ":："):
-        return None
-    return rest.lstrip(" \t\r\n:：").strip()
+def agent_request(text, prefix=agent.PREFIX):
+    """What the user asks with "<prefix> …" (case aside, then a space, a colon, a line or nothing), or None when the
+    text is not one: for "/agent", "/agents" is not."""
+    return agent.after_prefix(text, prefix)
 
 
 def _kind_label(kind):

@@ -1,6 +1,6 @@
 # Feishu through LarkAgentX (larkx)
 
-Feishu as yourself, through [LarkAgentX](https://github.com/cv-cat/LarkAgentX): sign in to the Feishu web client with a QR code, receive every message over its long connection into the inbox and the knowledge base, and send as yourself after you confirm the full text on the phone. Write `/agent <what to do>` in any chat to hand it to the assistant, whose answer appears under it, as you, marked as an AI answer. A Python program; Persona needs no change.
+Feishu as yourself, through [LarkAgentX](https://github.com/cv-cat/LarkAgentX): sign in to the Feishu web client with a QR code, receive every message over its long connection into the inbox and the knowledge base, and send as yourself after you confirm the full text on the phone. Write `/agent <what to do>` (the prefix is a setting) or @-mention yourself in any chat to hand it to the assistant, whose answer appears under it, as you, marked as an AI answer; in a topic you can go on without the prefix. A Python program; Persona needs no change.
 
 Read this before installing:
 
