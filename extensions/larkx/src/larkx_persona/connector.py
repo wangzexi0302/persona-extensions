@@ -54,7 +54,7 @@ SEND_SCHEMA = {
     "properties": {
         "chat": {"type": "string", "description": "The chat's id, from larkx_chats or an inbox item."},
         "text": {"type": "string", "description": "The message, plain text."},
-        "reply_to": {"type": "string", "description": "A message's id, to answer in its topic."},
+        "reply_to": {"type": "string", "description": "A message's id, to answer it: the reply quotes it, in its topic."},
     },
     "required": ["chat", "text"],
 }
@@ -280,7 +280,7 @@ class Connector:
         asked = agent.read(m, me, self.agent)
         if asked is not None:
             text, how = asked
-            topic = m.get("root") or m["id"]
+            topic = _topic_of(m)
             if agent.is_stop(text):
                 self.store.end_topic(topic)
                 text = "/stop"
@@ -293,7 +293,8 @@ class Connector:
     def _follow_up(self, m):
         """The user's message without a trigger, in a topic where they asked lately: /stop ends it, and anything else
         goes on to the assistant while the settings follow topics of that kind of chat."""
-        topic = self.store.topic(m.get("root") or "") if m.get("root") else None
+        # Only a message in the topic: a quote reply in the main chat is not, and an answer to it opens a topic of its own.
+        topic = self.store.topic(_topic_of(m)) if _topic_of(m) != m["id"] else None
         if topic is None or topic["chat"] != m["chat"]:
             return
         if time.time() - topic["last_at"] > self.agent.follow_seconds:
@@ -341,17 +342,18 @@ class Connector:
 
         def send():
             try:
-                self._post(m["chat"], text, m.get("root") or m["id"])
+                self._post(m["chat"], text, *_reply_to(m))
             except Exception as e:
-                self._log("agent: the deny reply failed: %s" % type(e).__name__)
+                self._log("agent: the deny reply failed: %s" % _why(e))
 
         threading.Thread(target=send, daemon=True).start()
 
-    def _post(self, chat, text, root):
-        """Sends as the user, remembering it was this program: its echo on the long connection is no request."""
+    def _post(self, chat, text, root, parent=None):
+        """Sends as the user, remembering it was this program: its echo on the long connection is no request. With
+        root, in that topic, quoting parent."""
         with self._lock:
             self._sending[(chat, text.strip())] = time.time()
-        msg_id = self.backend.send(chat, text, root)
+        msg_id = self.backend.send(chat, text, root, parent)
         if msg_id:
             self.store.add_own(str(msg_id), time.time())
         return msg_id
@@ -379,7 +381,7 @@ class Connector:
             if parent:
                 message["quote"] = _line(parent)
         # Kept before the hub has it: channel.send answers only a request handed over.
-        self.store.add_ask(m["id"], m["chat"], m.get("root") or m["id"], m.get("sender") or "", time.time())
+        self.store.add_ask(m["id"], m["chat"], _topic_of(m), m.get("sender") or "", time.time())
         for wait in AGENT_RETRY_SECONDS + [None]:
             try:
                 # The hub keeps each message id once: handing it over again after a cut-off call answers it once.
@@ -448,14 +450,16 @@ class Connector:
                 return {"message_id": result}
             raise RpcError(_UNKNOWN_SEND)
         text = (p.get("text") or "").rstrip() + "\n\n" + AGENT_SUFFIX
+        root, parent = _reply_to(request)
         try:
-            msg_id = self._post(request["chat"], text, request.get("root") or request["id"])
-        except Exception:
+            msg_id = self._post(request["chat"], text, root, parent)
+        except Exception as e:
+            self._log("agent: the answer did not go out: %s" % _why(e))
             msg_id = None
         if not msg_id:
             raise RpcError(_UNKNOWN_SEND)
         self.store.finish_send(key, str(msg_id))
-        self.store.touch_topic(request.get("root") or request["id"], time.time())
+        self.store.touch_topic(root, time.time())
         return {"message_id": str(msg_id)}
 
     def _answerable(self, request, me):
@@ -620,7 +624,7 @@ class Connector:
         return {"action": {"name": name, "visible": where}, "summary": summary}
 
     def _quoted(self, reply_to):
-        """The confirmation's line for reply_to: the reply goes into that message's topic, so it says which one."""
+        """The confirmation's line for reply_to: the reply quotes that message, in its topic, so it says which one."""
         m = self.store.message(reply_to)
         if m is None:
             return "回复：话题里的一条消息（这里没有它的内容）\n"
@@ -658,13 +662,14 @@ class Connector:
         raise RpcError(_UNKNOWN_SEND)
 
     def _send(self, key, chat, text, reply_to):
-        root = None
+        root, parent = None, None
         if reply_to:
-            quoted = self.store.message(reply_to) or {}
-            root = quoted.get("root") or reply_to
+            # A message not kept here starts its own topic, as far as can be known.
+            root, parent = _reply_to(self.store.message(reply_to) or {"id": reply_to})
         try:
-            msg_id = self._post(chat, text, root)
-        except Exception:
+            msg_id = self._post(chat, text, root, parent)
+        except Exception as e:
+            self._log("sending did not go out: %s" % _why(e))
             msg_id = None
         if not msg_id:
             # Left without a result on purpose: this key is never tried again.
@@ -932,6 +937,28 @@ def _title(chat):
     if chat.get("name"):
         return chat["name"]
     return DM_UNKNOWN if chat.get("kind") == "dm" else "飞书会话"
+
+
+def _why(e):
+    """A failed send in the log: the backend's own words when it gives some (never a message's text), else the error's kind."""
+    return getattr(e, "why", "") or type(e).__name__
+
+
+def _topic_of(m):
+    """The topic m is in, or the one an answer to it opens. A message with a root is in a topic only when it has no place
+    in the chat (Feishu gives topic replies position -3): one in the main chat that has a root is a quote reply, and its
+    root is the start of the quoted chain, not a topic. Feishu takes a topic reply that quotes the topic's root or a
+    message in the topic, never one in the main chat, so an answer to a quote reply opens a topic on the quote reply
+    itself, as Feishu's own clients do."""
+    if m.get("root") and (m.get("position") or 0) <= 0:
+        return m["root"]
+    return m["id"]
+
+
+def _reply_to(m):
+    """Where an answer to message m goes: (the topic, the message it quotes). The quote is m itself, so an answer to a
+    request that replied to someone else's message shows under the request, not under that message."""
+    return _topic_of(m), m["id"]
 
 
 def _required(args, name):

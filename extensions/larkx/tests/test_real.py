@@ -23,9 +23,9 @@ class RealTest(unittest.TestCase):
         os.environ["LARKX_HOME"] = cls.home.name
         import larkx
         from larkx import media
-        from larkx.proto import decoders
+        from larkx.proto import builders, decoders
         from larkx.proto import proto_pb2 as P
-        cls.larkx, cls.media, cls.decoders, cls.P = larkx, media, decoders, P
+        cls.larkx, cls.media, cls.decoders, cls.builders, cls.P = larkx, media, decoders, builders, P
 
     @classmethod
     def tearDownClass(cls):
@@ -143,6 +143,100 @@ class RealTest(unittest.TestCase):
         m = self.normalized(self.frame([self.message("9004", 5, content.SerializeToString())]))[0]
         self.assertEqual(m["type"], "IMAGE")
         self.assertEqual(m["media"], [{"kind": "image", "key": "img_key"}])
+
+    # sending: what a reply's packet says (the server shows a reply under the message parentId names)
+
+    def request(self, packet):
+        """The PutMessageRequest a send packet carries."""
+        self.assertEqual(packet.cmd, 5)
+        req = self.P.PutMessageRequest()
+        req.ParseFromString(packet.payload)
+        return req
+
+    def packet(self, **kwargs):
+        from larkx_persona.real import message_packet
+        return self.request(message_packet(self.builders, self.P, "收到", "6001", "req-1", **kwargs))
+
+    def test_an_answer_to_a_request_that_starts_its_topic(self):
+        """The request 9100 is in no topic (a plain message, or a quote reply to someone else's in the main chat): the
+        answer opens a topic on it and quotes it, as LarkAgentX's own send_msg would."""
+        req = self.packet(root="9100", parent="9100")
+        self.assertEqual((req.chatId, req.rootId, req.parentId, req.isReplyInThread), ("6001", "9100", "9100", True))
+        self.assertEqual(req.content.richText.innerText, "收到")
+
+    def test_an_answer_to_a_request_in_someone_elses_topic(self):
+        """The request 9105 was written in the topic of someone's 9100: the answer stays in 9100's topic and quotes 9105."""
+        req = self.packet(root="9100", parent="9105")
+        self.assertEqual((req.chatId, req.rootId, req.parentId, req.isReplyInThread), ("6001", "9100", "9105", True))
+        self.assertEqual(req.content.richText.innerText, "收到")
+        self.assertEqual(req.type, 4)
+
+    def test_a_topic_group_gets_no_reply_in_thread(self):
+        # Topic groups refuse it (LarkAgentX's builder says so); the quote is set all the same.
+        req = self.packet(root="9100", parent="9105", thread_chat=True)
+        self.assertEqual((req.rootId, req.parentId), ("9100", "9105"))
+        self.assertFalse(req.HasField("isReplyInThread"))
+
+    def test_without_a_topic_nothing_is_quoted(self):
+        for parent in (None, "9105"):
+            req = self.packet(root=None, parent=parent)
+            self.assertFalse(req.HasField("rootId") or req.HasField("parentId") or req.HasField("isReplyInThread"))
+        # A parent not given quotes the root, as LarkAgentX's own send does.
+        self.assertEqual(self.packet(root="9100").parentId, "9100")
+
+    def answer(self, msg_id="", status=0):
+        """The gateway's answer to a send: the new message's id, or none and a status."""
+        reply = self.P.Packet()
+        reply.status = status
+        response = self.P.PutMessageResponse()
+        if msg_id:
+            response.message.id = msg_id
+        reply.payload = response.SerializeToString()
+        return reply.SerializeToString()
+
+    def test_an_answer_without_a_message_id_was_not_taken(self):
+        from larkx_persona.real import NotSent, sent_id
+        self.assertEqual(sent_id(self.answer("9200"), self.P), "9200")
+        self.assertEqual(self.builders.decode_put_message_response(self.answer("9200")), "9200")
+        with self.assertRaises(NotSent) as e:
+            sent_id(self.answer(status=7), self.P)
+        self.assertEqual(e.exception.why, "Feishu returned no message id (gateway status 7)")
+
+    def test_send_posts_the_packet_through_larkagentx(self):
+        from larkx_persona.real import NotSent, RealBackend
+        P, posted, asked, answer = self.P, [], [], self.answer
+
+        class Client:
+            fail = None
+
+            def is_thread_chat(self, chat):
+                asked.append(chat)
+                return False
+
+            def _gateway_post(self, packet):
+                if isinstance(self.fail, Exception):
+                    raise self.fail
+                posted.append(packet)
+                return answer(status=3) if self.fail else answer("9200")
+
+        backend = RealBackend(ROOT, self.home.name, "feishu")
+        backend._client, backend._builders, backend._proto = Client(), self.builders, P
+        backend._request_id = lambda: "req-1"
+        self.assertEqual(backend.send("6001", "收到", "9100", "9105"), "9200")
+        req = self.request(posted[0])
+        self.assertEqual((req.rootId, req.parentId, req.isReplyInThread), ("9100", "9105", True))
+        self.assertEqual(posted[0].cid, "req-1")
+        self.assertEqual(asked, ["6001"])
+        self.assertEqual(backend.send("6001", "收到", None), "9200")
+        self.assertFalse(self.request(posted[1]).HasField("rootId"))
+        self.assertEqual(asked, ["6001"])
+        # A send that cannot be confirmed raises: the connector never tries it again.
+        backend._client.fail = OSError("cut off")
+        with self.assertRaises(OSError):
+            backend.send("6001", "收到", "9100", "9105")
+        backend._client.fail = "refused"
+        with self.assertRaises(NotSent):
+            backend.send("6001", "收到", "9100", "9105")
 
     def test_credentials_go_through_the_hub_and_never_a_file(self):
         from larkx_persona.real import RealBackend

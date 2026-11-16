@@ -105,6 +105,41 @@ def raw_message(v, chat, decoders):
             "content": summary, "content_data": data}
 
 
+class NotSent(RuntimeError):
+    """Feishu answered a send without the new message's id: it did not take it. why is for the log (no message text)."""
+
+    def __init__(self, status):
+        self.why = "Feishu returned no message id (gateway status %d)" % status
+        super().__init__(self.why)
+
+
+def sent_id(content, proto):
+    """The id Feishu gave a sent message, from the gateway's answer (LarkAgentX's decode_put_message_response, with the
+    status kept for the log). proto is LarkAgentX's proto_pb2. Pure, for the tests."""
+    packet = proto.Packet()
+    packet.ParseFromString(content)
+    response = proto.PutMessageResponse()
+    response.ParseFromString(packet.payload)
+    if not response.message.id:
+        raise NotSent(packet.status)
+    return response.message.id
+
+
+def message_packet(builders, proto, text, chat, request_id, root=None, parent=None, thread_chat=False):
+    """The packet that sends text to chat: in root's topic, quoting parent, when root is given. LarkAgentX's builder
+    quotes the topic's root (parentId = rootId), so a request that replies to someone else's message would get its
+    answer under that message: parent is put over it, the rest (rootId, isReplyInThread outside topic groups) stays
+    as LarkAgentX makes it. builders and proto are LarkAgentX's modules. Pure, for the tests."""
+    root = str(root) if root else None
+    packet = builders.build_send_message_packet(text, str(chat), request_id, root_id=root, thread_chat=thread_chat)
+    if root and parent and str(parent) != root:
+        req = proto.PutMessageRequest()
+        req.ParseFromString(packet.payload)
+        req.parentId = str(parent)
+        packet.payload = req.SerializeToString()
+    return packet
+
+
 def fetch_upstream(lock, data_dir, urlopen=urllib.request.urlopen):
     """LarkAgentX at lock's commit, in data_dir: the directory to put on sys.path. Downloaded once from lock's archive;
     only the files lock names are kept, each with its SHA-256, and any one missing or different fails the whole."""
@@ -170,6 +205,9 @@ class RealBackend:
         self._extract_key = None
         self._read_mentions = None
         self._decoders = None
+        self._builders = None
+        self._proto = None
+        self._request_id = None
         self._lark = None
 
     def prepare(self):
@@ -189,11 +227,12 @@ class RealBackend:
         logger.add(sys.stderr, level="ERROR", format="larkx: {level} {name}:{function}:{line}")
         import larkx
         from larkx import media
-        from larkx.proto import decoders, proto_pb2
+        from larkx.proto import builders, decoders, ids, proto_pb2
         self._lark = larkx
         self._extract_key = media.extract_resource_key
         self._read_mentions = lambda data: mentions(data, proto_pb2.AtProperty)
         self._decoders = decoders
+        self._builders, self._proto, self._request_id = builders, proto_pb2, ids.generate_long_request_id
 
     def _deps(self):
         requirements = os.path.join(self._root, "requirements.txt")
@@ -343,8 +382,13 @@ class RealBackend:
 
         asyncio.run(until_stopped())
 
-    def send(self, chat, text, root):
-        return self._client.send_msg(text, chat, root_id=root)
+    def send(self, chat, text, root, parent=None):
+        """Sends text as the user; in root's topic and quoting parent (root itself when there is none) when root is
+        given. LarkAgentX's send_msg with the packet of message_packet: the new message's id. Raises when the send
+        cannot be confirmed (NotSent when Feishu answered without an id), which the connector never tries again."""
+        thread_chat = bool(root) and self._client.is_thread_chat(chat)
+        packet = message_packet(self._builders, self._proto, text, chat, self._request_id(), root, parent, thread_chat)
+        return sent_id(self._client._gateway_post(packet), self._proto)
 
     def create_chat(self, user):
         chat = self._client.create_chat(user)

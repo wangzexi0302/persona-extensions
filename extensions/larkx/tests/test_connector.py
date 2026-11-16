@@ -76,10 +76,10 @@ class Backend:
         on_link("up")
         stop.wait()
 
-    def send(self, chat, text, root):
+    def send(self, chat, text, root, parent=None):
         if self.send_error:
             raise self.send_error
-        self.sent.append((chat, text, root))
+        self.sent.append((chat, text, root, parent))
         return self.send_result
 
     def create_chat(self, user):
@@ -212,7 +212,7 @@ class ConnectorTest(unittest.TestCase):
         first = self.c.actions_do({"name": "larkx_send", "args": args, "request_id": "r1"})
         again = self.c.actions_do({"name": "larkx_send", "args": args, "request_id": "r1"})
         self.assertEqual(first, again)
-        self.assertEqual(self.backend.sent, [("c1", "三点见", None)])
+        self.assertEqual(self.backend.sent, [("c1", "三点见", None, None)])
 
     def test_a_send_that_may_have_gone_out_is_never_repeated(self):
         self.sign_in()
@@ -239,18 +239,35 @@ class ConnectorTest(unittest.TestCase):
         self.sign_in()
         for _ in range(2):
             self.assertEqual(self.c.inbox_reply({"thread": "c1", "text": "好", "client_id": "k1"}), {})
-        self.assertEqual(self.backend.sent, [("c1", "好", None)])
+        self.assertEqual(self.backend.sent, [("c1", "好", None, None)])
 
-    def test_a_reply_to_a_topic_stays_in_it(self):
+    def test_a_reply_to_a_topic_stays_in_it_and_quotes_the_message(self):
         self.sign_in()
-        self.c.on_message(message("m2", "g1", 2, kind="group", root="m1"))
+        # Feishu gives a topic reply position -3: it has no place in the chat.
+        self.c.on_message(message("m2", "g1", -3, kind="group", root="m1"))
         self.c.actions_do({"name": "larkx_send", "args": {"chat": "g1", "text": "好", "reply_to": "m2"}, "request_id": "r1"})
-        self.assertEqual(self.backend.sent, [("g1", "好", "m1")])
+        self.assertEqual(self.backend.sent, [("g1", "好", "m1", "m2")])
+
+    def test_a_reply_to_a_quote_reply_opens_a_topic_on_it(self):
+        """A quote reply in the main chat has a root (the start of what it quotes) but is in no topic: Feishu takes no
+        topic reply quoting it in that root's topic, so the reply opens a topic on the quote reply itself."""
+        self.sign_in()
+        self.c.on_message(message("m3", "g1", 3, kind="group", root="m1"))
+        self.c.actions_do({"name": "larkx_send", "args": {"chat": "g1", "text": "好", "reply_to": "m3"}, "request_id": "r1"})
+        self.assertEqual(self.backend.sent, [("g1", "好", "m3", "m3")])
+
+    def test_a_reply_to_a_message_out_of_any_topic_starts_its_topic(self):
+        self.sign_in()
+        self.c.on_message(message("m1", "g1", 1, kind="group"))
+        self.c.actions_do({"name": "larkx_send", "args": {"chat": "g1", "text": "好", "reply_to": "m1"}, "request_id": "r1"})
+        # A message not kept here: taken as the start of its topic.
+        self.c.actions_do({"name": "larkx_send", "args": {"chat": "g1", "text": "好", "reply_to": "m_gone"}, "request_id": "r2"})
+        self.assertEqual(self.backend.sent, [("g1", "好", "m1", "m1"), ("g1", "好", "m_gone", "m_gone")])
 
     def test_a_dm_to_a_person_opens_their_chat(self):
         self.sign_in()
         self.c.actions_do({"name": "larkx_send_dm", "args": {"user": "u_b", "text": "好"}, "request_id": "r1"})
-        self.assertEqual(self.backend.sent, [("c_u_b", "好", None)])
+        self.assertEqual(self.backend.sent, [("c_u_b", "好", None, None)])
 
     def test_nothing_is_sent_signed_out(self):
         self.c._ready.set()

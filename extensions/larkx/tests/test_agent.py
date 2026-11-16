@@ -216,16 +216,69 @@ class AgentTest(unittest.TestCase):
         self.handed()
         out = self.c.channel_send({"ref": "r1", "text": "这是总结", "kind": "answer", "reply_to": "m1"})
         self.assertEqual(out, {"message_id": "m_new"})
-        self.assertEqual(self.backend.sent, [("c1", "这是总结\n\n" + AGENT_SUFFIX, "m1")])
+        # The request starts the topic: it is the root and the message quoted.
+        self.assertEqual(self.backend.sent, [("c1", "这是总结\n\n" + AGENT_SUFFIX, "m1", "m1")])
         self.assertEqual(self.c.channel_send({"ref": "r1", "text": "这是总结", "kind": "answer", "reply_to": "m1"}),
                          {"message_id": "m_new"})
         self.assertEqual(len(self.backend.sent), 1)
 
-    def test_an_answer_in_a_topic_stays_in_the_topic(self):
-        self.c._on_live(message("m2", "g1", 2, kind="group", sender=ME, text="/agent 看看", root="m_root"))
+    def test_an_answer_in_a_topic_stays_in_the_topic_and_quotes_the_request(self):
+        """A request written in someone else's topic: everything sent for it (progress, the answer, the answer to what
+        follows in the topic) stays in that topic and quotes the message that asked, never the topic's root."""
+        self.connect(agent_follow="all")
+        self.c._on_live(message("m_root", "g1", 1, kind="group", sender=ZHANG, text="周五发布"))
+        self.c._on_live(dict(message("m2", "g1", -3, kind="group", sender=ME, text="/agent 看看", root="m_root"),
+                             parent="m_root"))
         self.handed()
+        self.c.channel_send({"ref": "p1", "text": "在看", "kind": "progress", "reply_to": "m2"})
         self.c.channel_send({"ref": "r1", "text": "好", "kind": "answer", "reply_to": "m2"})
-        self.assertEqual(self.backend.sent[0][2], "m_root")
+        self.c._on_live(message("m3", "g1", -3, kind="group", sender=ME, text="再看看", root="m_root"))
+        self.assertEqual(self.handed(2)["message"]["id"], "m3")
+        self.c.channel_send({"ref": "r2", "text": "好", "kind": "answer", "reply_to": "m3"})
+        self.assertEqual([x[2:] for x in self.backend.sent], [("m_root", "m2"), ("m_root", "m2"), ("m_root", "m3")])
+        self.assertEqual(self.c.store.ask("m2")["topic"], "m_root")
+
+    def test_a_request_that_replies_to_someone_else_is_the_one_answered(self):
+        """The user quote-replies to someone's message with a request, in the main chat: the request has that message
+        as its root but is in no topic, and Feishu takes no topic reply under that message that quotes the request. So
+        everything sent for it (progress, the answer, the answers to what follows, the note after /stop) goes into the
+        topic the answer opens on the request, quoting the message that asked, never the other person's."""
+        self.c._on_live(message("m_doc", "c1", 1, sender="u_a", text="https://example.com/doc"))
+        self.c._on_live(dict(message("m_ask", "c1", 2, sender=ME, text="/agent 改一下这个文档的流程", root="m_doc"),
+                             parent="m_doc"))
+        got = self.handed()["message"]
+        self.assertEqual(got["id"], "m_ask")
+        self.assertIn("https://example.com/doc", got["quote"])
+        self.c.channel_send({"ref": "p1", "text": "在改了", "kind": "progress", "reply_to": "m_ask"})
+        self.answer("m_ask", "r1", "改好了")
+        # Going on in that topic needs no prefix.
+        self.c._on_live(message("m_more", "c1", -3, sender=ME, text="再加一步", root="m_ask"))
+        self.assertEqual(self.handed(2)["message"]["id"], "m_more")
+        self.answer("m_more", "r2", "加上了")
+        # Another quote reply in the main chat is in no topic: not a follow-up.
+        self.c._on_live(message("m_side", "c1", 3, sender=ME, text="顺便说一句", root="m_doc"))
+        self.nothing_handed(2)
+        self.c._on_live(message("m_stop", "c1", -3, sender=ME, text="/stop", root="m_ask"))
+        self.assertEqual(self.handed(3)["message"]["text"], "/stop")
+        self.c.channel_send({"ref": "n1", "text": "已停下", "kind": "note", "reply_to": "m_stop"})
+        self.assertEqual([(chat, root, parent) for chat, _, root, parent in self.backend.sent],
+                         [("c1", "m_ask", "m_ask"), ("c1", "m_ask", "m_ask"), ("c1", "m_ask", "m_more"), ("c1", "m_ask", "m_stop")])
+        self.assertIsNone(self.c.store.topic("m_ask"))
+
+    def test_a_send_that_fails_says_why_in_the_log(self):
+        self.c._on_live(message("m1", "c1", 1, sender=ME, text="/agent 发"))
+        self.handed()
+        refused = RuntimeError("the text must not reach the log")
+        refused.why = "Feishu returned no message id (gateway status 7)"
+        self.backend.send_error = refused
+        with self.assertRaises(RpcError):
+            self.answer("m1", "r1")
+        self.assertIn("agent: the answer did not go out: Feishu returned no message id (gateway status 7)", self.hub.logged)
+        self.backend.send_error = OSError("no route")
+        with self.assertRaises(RpcError):
+            self.answer("m1", "r2")
+        self.assertIn("agent: the answer did not go out: OSError", self.hub.logged)
+        self.assertFalse(any("must not" in x for x in self.hub.logged))
 
     def test_nothing_goes_where_the_user_did_not_ask(self):
         self.c.on_message(message("m1", "c1", 1, sender="u_a", text="在吗"))
@@ -328,7 +381,7 @@ class AgentTest(unittest.TestCase):
         while not self.backend.sent and time.time() < deadline:
             time.sleep(0.01)
         time.sleep(0.1)
-        self.assertEqual(self.backend.sent, [("c1", "这个助手只替我本人干活。", "m1")])
+        self.assertEqual(self.backend.sent, [("c1", "这个助手只替我本人干活。", "m1", "m1")])
         # Its echo, the user's own message now, is no request either.
         self.c._on_live(message("m_new", "c1", 4, sender=ME, text="这个助手只替我本人干活。", root="m1"))
         self.nothing_handed()
@@ -339,7 +392,7 @@ class AgentTest(unittest.TestCase):
         self.c.on_message(message("m1", "c_z", 1, sender=ZHANG, text="/agent 帮我查下"))
         self.c.store.add_ask("m1", "c_z", "m1", ZHANG, time.time())
         self.assertEqual(self.answer("m1", "r1"), {"message_id": "m_new"})
-        self.assertEqual(self.backend.sent, [("c_z", "好\n\n" + AGENT_SUFFIX, "m1")])
+        self.assertEqual(self.backend.sent, [("c_z", "好\n\n" + AGENT_SUFFIX, "m1", "m1")])
         self.connect()
         with self.assertRaises(RpcError) as e:
             self.answer("m1", "r2")
@@ -363,7 +416,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(got["text"], "接着问")
         self.assertIn("接着说的", got["forward"])
         self.assertEqual(self.answer("m2", "r2"), {"message_id": "m_new"})
-        self.assertEqual(self.backend.sent[-1][2], "m1")
+        self.assertEqual(self.backend.sent[-1][2:], ("m1", "m2"))
         # Outside the topic a message without the prefix is just a message.
         self.c._on_live(message("m3", "c1", 2, sender=ME, text="主线上的话"))
         self.nothing_handed(2)
